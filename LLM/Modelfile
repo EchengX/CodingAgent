@@ -1,4 +1,4 @@
-FROM gpt-oss:20b
-PARAMETER num_ctx 32768
+FROM deepseek-coder-v2:16b
+PARAMETER num_ctx 16384
 PARAMETER temperature 0
 PARAMETER seed 42

@@ -1,7 +1,6 @@
 # 按照用户给出的路径（绝对或相对）查找、阅读、修改、创建、删除本地文件和文件夹
 # 未提供具体路径则默认/Users/xxxx/work/CodingAgent/Workspace
 import os
-import shlex
 import subprocess
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -9,6 +8,9 @@ from urllib.request import Request, urlopen
 from agents import function_tool
 
 WORKSPACE = "/Users/xxxx/work/CodingAgent/Workspace"
+MEMORY_PATH = os.path.join(WORKSPACE, "memory.md")
+MEMORY_EMPTY = "尚无交接"
+MEMORY_MAX_CHARS = 12000
 SKIP_DIR_NAMES = {
     "vendor",
     "node_modules",
@@ -19,13 +21,76 @@ SKIP_DIR_NAMES = {
 }
 
 def _abs(path: str) -> str:
-    if not path or path.strip() == "":
+    text = (path or "").strip().strip("'\"")
+    if not text:
         raise ValueError("path is empty")
-    return os.path.abspath(path)
+
+    text = text.replace("\\", "/")
+    if text.startswith("file://"):
+        text = text[7:]
+    text = os.path.expandvars(text)
+    text = os.path.expanduser(text)
+    text = text.strip()
+
+    while text.startswith("./"):
+        text = text[2:].lstrip()
+
+    # "Users/xxxx/..." 或被 cwd 拼进去后的 ".../Users/xxxx/..."
+    nested_home = text.find(" /Users/")
+    if nested_home >= 0:
+        text = text[nested_home + 1 :]
+    first_users = text.find("/Users/")
+    second_users = text.find("/Users/", first_users + 1) if first_users >= 0 else -1
+    if second_users > first_users:
+        text = text[second_users:]
+    elif text.startswith("Users/"):
+        text = "/" + text
+
+    text = text.strip()
+    if not os.path.isabs(text):
+        text = os.path.abspath(text)
+    return os.path.normpath(text)
 
 
 def _prune_walk_dirs(dirs):
     dirs[:] = [name for name in dirs if name not in SKIP_DIR_NAMES]
+
+
+def read_memory_text() -> str:
+    if not os.path.isfile(MEMORY_PATH):
+        return MEMORY_EMPTY
+    with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+    return text if text else MEMORY_EMPTY
+
+
+def clear_memory_file() -> None:
+    if os.path.isfile(MEMORY_PATH):
+        os.remove(MEMORY_PATH)
+
+
+@function_tool
+def save_memory(content: str) -> str:
+    """覆盖写入本轮交接。必须含需求原文和缺失文件列表，以及路径/要点。"""
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("memory content is empty")
+    if len(text) > MEMORY_MAX_CHARS:
+        text = text[:MEMORY_MAX_CHARS] + "\n... [truncated]"
+    parent = os.path.dirname(MEMORY_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        f.write(text)
+        if not text.endswith("\n"):
+            f.write("\n")
+    return "save memory success: " + MEMORY_PATH
+
+
+@function_tool
+def read_memory() -> str:
+    """读取轮次交接备忘录。文件不存在或为空时返回「尚无交接」。"""
+    return read_memory_text()
 
 @function_tool
 def find(path: str):
@@ -88,6 +153,40 @@ def write_file(path: str, content: str):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     return "write success: " + path
+
+
+@function_tool
+def replace_in_file(path: str, old: str, new: str) -> str:
+    """只替换文件中第一次出现的 old 为 new，返回改动处前后若干行。"""
+    path = _abs(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    if not old:
+        raise ValueError("old is empty")
+
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    index = text.find(old)
+    if index < 0:
+        raise ValueError("old not found in " + path)
+
+    updated = text[:index] + new + text[index + len(old) :]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(updated)
+
+    start_line = updated[:index].count("\n") + 1
+    end_line = updated[: index + len(new)].count("\n") + 1
+    lines = updated.splitlines(keepends=True)
+    ctx_start = max(1, start_line - 3)
+    ctx_end = min(len(lines), end_line + 3)
+    snippet = "".join(lines[ctx_start - 1 : ctx_end])
+    return (
+        f"replace success: {path}\n"
+        f"replaced first match at lines {start_line}-{end_line}\n"
+        f"context lines {ctx_start}-{ctx_end} of {len(lines)}\n"
+        f"{snippet}"
+    )
+
 
 @function_tool
 def create_file(path: str, content: str = ""):
@@ -162,22 +261,31 @@ def search_file(path: str, keyword: str, max_results: int = 50):
                 continue
     return results
 
-@function_tool
-def run_generator(command: str, cwd: str = WORKSPACE) -> str:
-    # 在指定目录运行命令并返回退出码、标准输出和错误输出。
+def _run_command(command: str, cwd: str) -> str:
+    text = (command or "").strip()
+    if not text:
+        raise ValueError("command is empty")
     cwd = _abs(cwd)
     result = subprocess.run(
-        shlex.split(command),
+        text,
         cwd=cwd,
+        shell=True,
         capture_output=True,
         text=True,
         timeout=120,
+        executable="/bin/zsh",
     )
     return (
         f"returncode: {result.returncode}\n"
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
     )
+
+
+@function_tool
+def run_generator(command: str, cwd: str = WORKSPACE) -> str:
+    """在 cwd 下用 shell 运行命令。支持 &&、管道和重定向。返回 returncode、stdout、stderr。"""
+    return _run_command(command, cwd)
 
 @function_tool
 def fetch_url(url: str, save_path: str = "") -> str:
@@ -234,17 +342,5 @@ def fetch_url(url: str, save_path: str = "") -> str:
 
 @function_tool
 def read_command_output(command: str, cwd: str = WORKSPACE) -> str:
-    # 运行只读检查命令并返回退出码、标准输出和错误输出。
-    cwd = _abs(cwd)
-    result = subprocess.run(
-        shlex.split(command),
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    return (
-        f"returncode: {result.returncode}\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
-    )
+    """运行只读检查命令。支持 &&、管道和重定向。返回 returncode、stdout、stderr。"""
+    return _run_command(command, cwd)

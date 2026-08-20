@@ -13,11 +13,12 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.items import MessageOutputItem, ReasoningItem, ToolCallItem, ToolCallOutputItem
 
 from CodingAgent import CodingAgent
+from tools.Local.Local import clear_memory_file, read_memory_text
 
 ROUNDS = [
     "定位需求文档、背景目录和目标工作目录；完整阅读需求，整理必须实现、禁止出现和完成标准。需求里的 URL 用 fetch_url 读取（或读任务旁的本地简图）。如果有背景目录，阅读 README、规范和相关示例，不得虚构 API。跳过 vendor、node_modules。",
     "根据需求和背景资料按需求创建文件/文件夹，编写代码到目标工作目录。没有具体错误时不要无理由重写已有代码。",
-    "运行项目实际的解析、编译或构建命令；失败时根据 stderr 修改语法并重试，直到返回码为 0。产物存在且非空后，最后一行输出 VERIFY: PASS。",
+    "运行项目实际的解析、编译或构建命令；不通过则按错误提示修改代码并重试，直到返回码为 0。产物存在且非空后，最后一行输出 VERIFY: PASS。",
 ]
 
 TOOL_OUTPUT_LIMIT = 4000
@@ -118,22 +119,31 @@ async def run_round(prompt: str) -> str:
 
 
 async def run_workflow(user_input: str):
+    clear_memory_file()
     final_output = ""
 
     for index, round_task in enumerate(ROUNDS, 1):
+        memory = read_memory_text()
         prompt = f"""
 原始任务：
 {user_input}
+
+上一轮交接（需求原文、缺失列表、路径可直接用；编译对错仍以命令为准）：
+{memory}
 
 当前是第 {index}/{len(ROUNDS)} 轮：
 {round_task}
 
 严格只做当前轮要求的工作，不要提前执行后续轮次。
-必须重新读取当前真实文件，并以工具返回的真实内容和命令输出为依据。
-不要依赖之前回复中的总结；文件系统和命令结果才是真实状态。
+每轮开始先 read_memory。
+本轮有进展就 save_memory：必须原封不动附上需求文档全文；找不到的文件记入缺失列表，之后禁止再搜。
+目录不存在就 create_dir，不要反复 list_dir。
+交接中的路径、需求原文和缺失列表可以直接使用。
+编译是否通过必须重新跑命令，不能只信交接。
 没有具体错误或可验证的改进理由时，禁止重写已有代码。
 需要修改时只修改必要部分，禁止无理由推倒重写。
 必须实际使用工具，不要只说明计划或打印工具调用参数。
+工具 path 必须是以 / 开头的绝对路径。
 """
         _out(f"\n===== 第 {index}/{len(ROUNDS)} 轮开始 =====")
         try:
