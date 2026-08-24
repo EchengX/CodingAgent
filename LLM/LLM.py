@@ -264,6 +264,20 @@ def _request_model(request: httpx.Request) -> str:
         return MODEL_NAME
 
 
+def _rebuilt_response(
+    *,
+    status_code: int,
+    content: bytes,
+    request: httpx.Request,
+    headers: httpx.Headers | dict[str, str] | None = None,
+) -> httpx.Response:
+    """aread() 后 body 已是明文，保留 content-encoding 会让上层再解压一次。"""
+    out = httpx.Headers(headers or {})
+    out.pop("content-encoding", None)
+    out.pop("content-length", None)
+    return httpx.Response(status_code, headers=out, content=content, request=request)
+
+
 class ToolCallFixTransport(httpx.AsyncBaseTransport):
     def __init__(self, inner: httpx.AsyncBaseTransport):
         self._inner = inner
@@ -296,14 +310,14 @@ class ToolCallFixTransport(httpx.AsyncBaseTransport):
 
         if recovered is not None:
             if want_stream:
-                return httpx.Response(
-                    200,
+                return _rebuilt_response(
+                    status_code=200,
                     headers={"content-type": "text/event-stream"},
                     content=_as_sse(recovered),
                     request=request,
                 )
-            return httpx.Response(
-                200,
+            return _rebuilt_response(
+                status_code=200,
                 headers={"content-type": "application/json"},
                 content=json.dumps(recovered, ensure_ascii=False).encode("utf-8"),
                 request=request,
@@ -314,15 +328,15 @@ class ToolCallFixTransport(httpx.AsyncBaseTransport):
             and isinstance(payload, dict)
             and _fix_completion_json(payload)
         ):
-            return httpx.Response(
-                200,
+            return _rebuilt_response(
+                status_code=200,
                 headers={"content-type": "application/json"},
                 content=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 request=request,
             )
 
-        return httpx.Response(
-            response.status_code,
+        return _rebuilt_response(
+            status_code=response.status_code,
             headers=response.headers,
             content=raw,
             request=request,
