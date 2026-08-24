@@ -1,7 +1,9 @@
 # Agent启动入口
 
 import asyncio
+import json
 import sys
+from typing import Any
 
 from agents import (
     ItemHelpers,
@@ -13,26 +15,37 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.items import MessageOutputItem, ReasoningItem, ToolCallItem, ToolCallOutputItem
 
 from CodingAgent import CodingAgent
-from tools.Local.Local import clear_memory_file, read_memory_text
+from tools.Local.Local import clear_memory_file, clear_scratch_dir
 
-ROUNDS = [
-    "定位需求文档、背景目录和目标工作目录；完整阅读需求，整理必须实现、禁止出现和完成标准。需求里的 URL 用 fetch_url 读取（或读任务旁的本地简图）。如果有背景目录，阅读 README、规范和相关示例，不得虚构 API。跳过 vendor、node_modules。",
-    "根据需求和背景资料按需求创建文件/文件夹，编写代码到目标工作目录。没有具体错误时不要无理由重写已有代码。",
-    "运行项目实际的解析、编译或构建命令；不通过则按错误提示修改代码并重试，直到返回码为 0。产物存在且非空后，最后一行输出 VERIFY: PASS。",
-]
+MAX_TURNS = 200
 
-TOOL_OUTPUT_LIMIT = 4000
+TOOL_ARG_LIMIT = 300
+TOOL_OUTPUT_LINES = 5
+TOOL_OUTPUT_LIMIT = 500
+RECENT_TOOL_OUTPUTS = 10
 
 
 def _out(text: str = "", end: str = "\n") -> None:
     print(text, end=end, flush=True)
 
 
-def _clip(text: object, limit: int = TOOL_OUTPUT_LIMIT) -> str:
+def _clip(text: object, limit: int = TOOL_ARG_LIMIT) -> str:
     value = "" if text is None else str(text)
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n... [truncated {len(value) - limit} chars]"
+
+
+def _brief(text: object) -> str:
+    """工具结果只在终端展示前几行摘要，完整内容仍会进模型上下文。"""
+    value = "" if text is None else str(text)
+    lines = value.splitlines()
+    head = "\n".join(lines[:TOOL_OUTPUT_LINES])
+    head = _clip(head, TOOL_OUTPUT_LIMIT)
+    omitted = len(lines) - TOOL_OUTPUT_LINES
+    if omitted > 0:
+        head += f"\n... [省略 {omitted} 行，共 {len(value)} 字符]"
+    return head or "(无输出)"
 
 
 def _item_attr(item: object, name: str) -> object:
@@ -57,8 +70,82 @@ def _reasoning_text(item: ReasoningItem) -> str:
     return "\n".join(parts)
 
 
-async def run_round(prompt: str) -> str:
-    result = Runner.run_streamed(CodingAgent, prompt, max_turns=30)
+def _tool_output_summary(
+    name: str,
+    arguments: object,
+    output: object,
+) -> str:
+    arg_text = str(arguments or "").strip()
+    try:
+        parsed = json.loads(arg_text)
+        arg_text = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if len(arg_text) > 300:
+        arg_text = arg_text[:300] + "..."
+
+    output_text = str(output or "").strip()
+    lines = [line.strip() for line in output_text.splitlines() if line.strip()]
+    if name == "read":
+        useful = lines[:2]
+    elif name == "run":
+        useful = [line for line in lines if line.startswith("returncode:")][:1]
+        useful += lines[1:2]
+    else:
+        useful = lines[:1]
+    result = "; ".join(useful) if useful else "无文本输出"
+    return (
+        f"[旧工具结果摘要] {name or 'unknown'}({arg_text})"
+        f" -> {result}；原结果 {len(output_text)} 字符"
+    )
+
+
+def _compact_history(
+    history: list[Any],
+    keep_recent: int = RECENT_TOOL_OUTPUTS,
+) -> list[Any]:
+    """最近 10 条工具结果保留全文，更早的压成一行。需求细节以 read/read_image 结果为准。"""
+    compacted = list(history)
+    call_meta: dict[str, tuple[str, object]] = {}
+    output_indexes: list[int] = []
+
+    for index, item in enumerate(compacted):
+        item_type = _item_attr(item, "type")
+        if item_type == "function_call":
+            call_id = str(_item_attr(item, "call_id") or "")
+            call_meta[call_id] = (
+                str(_item_attr(item, "name") or "unknown"),
+                _item_attr(item, "arguments") or "",
+            )
+        elif item_type == "function_call_output":
+            output_indexes.append(index)
+
+    old_indexes = output_indexes[:-keep_recent] if keep_recent > 0 else output_indexes
+    for index in old_indexes:
+        item = compacted[index]
+        call_id = str(_item_attr(item, "call_id") or "")
+        name, arguments = call_meta.get(call_id, ("unknown", ""))
+        summary = _tool_output_summary(
+            name,
+            arguments,
+            _item_attr(item, "output"),
+        )
+        if isinstance(item, dict):
+            updated = dict(item)
+            updated["output"] = summary
+            compacted[index] = updated
+        elif hasattr(item, "model_copy"):
+            compacted[index] = item.model_copy(update={"output": summary})
+
+    return compacted
+
+
+def _task_message(user_input: str) -> str:
+    return f"原始任务：\n{user_input.strip()}"
+
+
+async def run_round(input_items: str | list[Any]) -> tuple[str, list[Any]]:
+    result = Runner.run_streamed(CodingAgent, input_items, max_turns=MAX_TURNS)
     streamed_text = False
     streamed_reason = False
 
@@ -111,52 +198,30 @@ async def run_round(prompt: str) -> str:
 
         elif event.name == "tool_output" and isinstance(event.item, ToolCallOutputItem):
             _out("\n----- 工具结果 -----")
-            _out(_clip(event.item.output))
+            _out(_brief(event.item.output))
 
     if streamed_text or streamed_reason:
         _out()
-    return result.final_output or ""
+    history = result.to_input_list(mode="normalized")
+    return result.final_output or "", _compact_history(history)
 
 
 async def run_workflow(user_input: str):
     clear_memory_file()
+    clear_scratch_dir()
+    history: list[Any] = [{"role": "user", "content": _task_message(user_input)}]
     final_output = ""
-
-    for index, round_task in enumerate(ROUNDS, 1):
-        memory = read_memory_text()
-        prompt = f"""
-原始任务：
-{user_input}
-
-上一轮交接（需求原文、缺失列表、路径可直接用；编译对错仍以命令为准）：
-{memory}
-
-当前是第 {index}/{len(ROUNDS)} 轮：
-{round_task}
-
-严格只做当前轮要求的工作，不要提前执行后续轮次。
-每轮开始先 read_memory。
-本轮有进展就 save_memory：必须原封不动附上需求文档全文；找不到的文件记入缺失列表，之后禁止再搜。
-目录不存在就 create_dir，不要反复 list_dir。
-交接中的路径、需求原文和缺失列表可以直接使用。
-编译是否通过必须重新跑命令，不能只信交接。
-没有具体错误或可验证的改进理由时，禁止重写已有代码。
-需要修改时只修改必要部分，禁止无理由推倒重写。
-必须实际使用工具，不要只说明计划或打印工具调用参数。
-工具 path 必须是以 / 开头的绝对路径。
-"""
-        _out(f"\n===== 第 {index}/{len(ROUNDS)} 轮开始 =====")
-        try:
-            final_output = await run_round(prompt)
-        except MaxTurnsExceeded as exc:
-            final_output = str(exc)
-            _out(f"\n本轮中断: {exc}")
-        _out(f"\n===== 第 {index}/{len(ROUNDS)} 轮结束 =====")
-        if final_output:
-            _out(final_output)
-
-    if "VERIFY: PASS" not in final_output:
-        _out(f"\n最终验收未明确通过，请检查第 {len(ROUNDS)} 轮输出。")
+    _out("\n===== 开始 =====")
+    try:
+        final_output, history = await run_round(history)
+    except MaxTurnsExceeded as exc:
+        final_output = str(exc)
+        _out(f"\n中断: {exc}")
+    _out("\n===== 结束 =====")
+    if final_output:
+        _out(final_output)
+    if "VERIFY: PASS" not in (final_output or ""):
+        _out("\n最终验收未明确通过，请检查输出中是否包含 VERIFY: PASS。")
 
 
 async def main():
@@ -168,7 +233,7 @@ async def main():
 
             await run_workflow(user_input)
         except Exception as e:
-            _out(str(e))
+            _out(f"{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
-# DeepSeek 官方 API（OpenAI 兼容）
+# 阿里云百炼（公司 MaaS）上的 DeepSeek V4 Pro，OpenAI 兼容
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -10,16 +9,11 @@ from agents import OpenAIChatCompletionsModel, set_tracing_disabled
 
 set_tracing_disabled(True)
 
-BASE_URL = "https://api.deepseek.com"
-MODEL_NAME = "deepseek-chat"
-# 优先环境变量 DEEPSEEK_API_KEY；没有则把 sk- 密钥填到下一行
-_FALLBACK_KEY = ""
-API_KEY = os.environ.get("DEEPSEEK_API_KEY") or _FALLBACK_KEY
+BASE_URL = "https://llm-n512stl9lp4z2bc8.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+MODEL_NAME = "deepseek-v4-pro"
+API_KEY = "sk-ws-H.EPXYDED.8sq3.MEYCIQDsT065x885c4Yy_HTWuf0E9DMlQR5kun2D9Aj6cfxdSAIhAMa5HMl-Od9W1-aREP0lVrCZATRerOG4e31JNy_vjeKt"
 if not API_KEY:
-    raise RuntimeError(
-        "未设置 DeepSeek 密钥。先 export DEEPSEEK_API_KEY=sk-你的密钥，"
-        "或把密钥写到 LLM.py 的 _FALLBACK_KEY。"
-    )
+    raise RuntimeError("未设置百炼密钥。把密钥填到 LLM.py 的 API_KEY。")
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -57,24 +51,34 @@ def _dump_arguments(args: dict[str, Any]) -> str:
 
 def _guess_tool_name(args: dict[str, Any]) -> str:
     keys = set(args)
+    path = str(args.get("path") or "")
+    if "reference_path" in keys or "reference_url" in keys:
+        return "compare_ui_images"
+    if "url" in keys and "branch" in keys:
+        return "git_clone"
+    if "url" in keys and ("click_text" in keys or "width" in keys or "height" in keys):
+        return "capture_screenshot"
+    if path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+        return "read_image"
+    if "url" in keys and "path" in keys:
+        return "read_image"
     if "url" in keys:
         return "fetch_url"
-    if "keyword" in keys:
-        return "search_file"
     if "command" in keys:
-        return "run_generator"
+        return "run"
     if "start_line" in keys or "max_lines" in keys:
-        return "open_file"
+        return "read"
+    if "files_only" in keys or "context" in keys or "keyword" in keys:
+        return "grep"
+    if "pattern" in keys:
+        return "glob"
     if "content" in keys and "path" in keys:
-        return "create_file"
-    if "content" in keys:
-        return "save_memory"
-    path = str(args.get("path") or "")
+        return "write_file"
     if path.endswith((".md", ".txt", ".php", ".sui", ".py", ".json", ".mjs")):
-        return "open_file"
+        return "read"
     if "path" in keys:
-        return "list_dir"
-    return "find"
+        return "read"
+    return "glob"
 
 
 def _tool_name_and_args(obj: dict[str, Any]) -> tuple[str, str]:
